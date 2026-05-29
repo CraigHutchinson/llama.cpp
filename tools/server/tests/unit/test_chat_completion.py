@@ -485,7 +485,7 @@ def test_context_size_exceeded_stream():
                 pass
         assert False, "Should have failed"
     except ServerError as e:
-        assert e.code == 400
+        assert e.code == 200, f"Expected 200 (error via SSE), got {e.code}"  # slot errors delivered as SSE events
         assert "error" in e.body
         assert e.body["error"]["type"] == "exceed_context_size_error"
         assert e.body["error"]["n_prompt_tokens"] > 0
