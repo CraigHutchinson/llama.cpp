@@ -377,8 +377,13 @@ class ServerProcess:
                 break
             elif line.startswith('data: '):
                 data = json.loads(line[6:])
+                if 'error' in data:
+                    # Slot-level errors are now delivered as SSE events (HTTP 200)
+                    # rather than non-streaming 4xx responses.
+                    raise ServerError(200, data)
                 print("Partial response from server", json.dumps(data, indent=2))
                 yield data
+            # SSE comment lines (e.g. keepalive ": ping") are skipped silently
 
     def make_any_request(
         self,

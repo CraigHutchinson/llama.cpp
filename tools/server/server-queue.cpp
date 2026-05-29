@@ -409,6 +409,38 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
     // should not reach here
 }
 
+// Single-shot poll: one recv_with_timeout round.
+// Returns the result if ready; nullptr with is_pending=true if not yet available
+// (caller should retry, e.g. emit an SSE keepalive comment); nullptr with
+// is_pending=false if should_stop() fired or the reader was cancelled.
+server_task_result_ptr server_response_reader::poll_once(
+        const std::function<bool()> & should_stop, bool & is_pending) {
+    is_pending = false;
+    if (cancelled || should_stop()) {
+        return nullptr;
+    }
+    server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
+    if (result == nullptr) {
+        // poll timed out with no result yet
+        is_pending = !should_stop();
+        return nullptr;
+    }
+    if (result->is_error()) {
+        stop(); // cancel remaining tasks
+        SRV_DBG("%s", "received error result, stopping further processing\n");
+        return result;
+    }
+    if (!states.empty()) {
+        const size_t idx = result->index;
+        GGML_ASSERT(idx < states.size());
+        result->update(states[idx]);
+    }
+    if (result->is_stop()) {
+        received_count++;
+    }
+    return result;
+}
+
 server_response_reader::batch_response server_response_reader::wait_for_all(const std::function<bool()> & should_stop) {
     batch_response batch_res;
     batch_res.results.clear();
