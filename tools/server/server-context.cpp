@@ -3723,35 +3723,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
     } else {
-        // in streaming mode, the first error must be treated as non-stream response
-        // this is to match the OAI API behavior
-        // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
-            return res; // connection is closed
-        }
-
-        if (first_result->is_error()) {
-            res->error(first_result->to_json());
-            return res;
-        }
-
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
-        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
-        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
-        } else {
-            res->data = format_oai_sse(first_result_json);
-        }
+        // Send HTTP 200 + "text/event-stream" headers immediately — before a
+        // slot is assigned or any token is generated — so that HTTP clients
+        // with a strict headersTimeout (e.g. undici's default 300 s) are not
+        // timed out while the request sits in the slot queue or during a long
+        // prefill phase.  While waiting, the next() callback emits SSE comment
+        // keep-alive lines (": ping\n\n") on each poll_once() timeout to
+        // prevent bodyTimeout from firing as well.
+        //
+        // Behaviour note: unlike the previous code, slot-level errors are now
+        // delivered as SSE error events (HTTP status stays 200) rather than a
+        // non-streaming 4xx response.  Parameter/tokenisation errors are still
+        // caught before rd.post_tasks() and returned as non-streaming 4xx
+        // responses, so the common error path is unaffected.
         res->status = 200;
         res->content_type = "text/event-stream";
         res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
@@ -3769,14 +3753,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             try {
                 if (req.should_stop()) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
-                    return false; // should_stop condition met
-                }
-
-                if (!res_this->data.empty()) {
-                    // flush the first chunk
-                    output = std::move(res_this->data);
-                    res_this->data.clear();
-                    return true;
+                    return false;
                 }
 
                 server_response_reader & rd = res_this->rd;
@@ -3795,23 +3772,33 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             break;
                     }
                     SRV_DBG("%s", "all results received, terminating stream\n");
-                    return false; // no more data, terminate
+                    return false;
                 }
 
-                // receive subsequent results
-                auto result = rd.next(req.should_stop);
+                // poll_once() returns immediately after one recv_with_timeout round;
+                // if no result is ready yet, emit an SSE comment to keep the
+                // connection alive (resets any bodyTimeout on the client side).
+                bool is_pending = false;
+                auto result = rd.poll_once(req.should_stop, is_pending);
+
+                if (is_pending) {
+                    output = ": ping\n\n";
+                    SRV_DBG("%s", "http: SSE keepalive sent while waiting for result\n");
+                    return true;
+                }
+
                 if (result == nullptr) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
-                    return false; // should_stop condition met
+                    return false;
                 }
 
-                // send the results
+                // send the result
                 if (result->is_error()) {
                     json res_json = result->to_json();
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
-                    return false; // terminate on error
+                    return false;
                 } else {
                     GGML_ASSERT(
                         dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr

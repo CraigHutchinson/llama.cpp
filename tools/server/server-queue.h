@@ -195,6 +195,13 @@ struct server_response_reader {
     // note: if one error is received, it will stop further processing and return error result
     server_task_result_ptr next(const std::function<bool()> & should_stop);
 
+    // Single-shot poll (one recv_with_timeout round).
+    // Returns the next result if one is ready, or nullptr in two cases:
+    //   is_pending = true  — no result yet, caller should retry (e.g. emit an SSE keepalive)
+    //   is_pending = false — should_stop() fired or reader was cancelled
+    // On error the reader is cancelled and the error result is returned (is_pending stays false).
+    server_task_result_ptr poll_once(const std::function<bool()> & should_stop, bool & is_pending);
+
     struct batch_response {
         bool is_terminated = false; // if true, indicates that processing was stopped before all results were received
         std::vector<server_task_result_ptr> results;
